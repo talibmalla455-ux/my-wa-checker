@@ -2,11 +2,13 @@ const {
     default: makeWASocket, 
     useMultiFileAuthState,
     DisconnectReason,
-    fetchLatestBaileysVersion
+    fetchLatestBaileysVersion,
+    makeCacheableSignalKeyStore
 } = require("@whiskeysockets/baileys");
 const express = require("express");
 const pino = require("pino");
 const cors = require("cors");
+const fs = require("fs");
 
 const app = express();
 app.use(cors());
@@ -15,7 +17,7 @@ const port = process.env.PORT || 3000;
 let sock;
 
 app.get('/', (req, res) => {
-    res.send("TK TOOL SERVER IS LIVE! PAIRING MODE ENABLED.");
+    res.send("TK TOOL SERVER STATUS: ONLINE // PAIRING READY");
 });
 
 async function connectToWhatsApp() {
@@ -25,9 +27,13 @@ async function connectToWhatsApp() {
     sock = makeWASocket({
         version,
         printQRInTerminal: false,
-        auth: state,
+        auth: {
+            creds: state.creds,
+            keys: makeCacheableSignalKeyStore(state.keys, pino({ level: 'silent' }))
+        },
         logger: pino({ level: 'silent' }),
-        browser: ["Ubuntu", "Chrome", "20.0.04"]
+        // Modern Browser Identity
+        browser: ["TK-TOOL", "Chrome", "128.0.0.0"]
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -36,7 +42,7 @@ async function connectToWhatsApp() {
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) connectToWhatsApp();
         } else if (connection === 'open') {
-            console.log('CONNECTED TO WHATSAPP');
+            console.log('--- WHATSAPP CONNECTED SUCCESSFULLY ---');
         }
     });
 
@@ -44,23 +50,33 @@ async function connectToWhatsApp() {
     return sock;
 }
 
+// Pairing Code Endpoint
 app.get('/get-code', async (req, res) => {
-    // Number ko saaf karna (remove +, spaces, dashes)
     let num = req.query.number;
     if (!num) return res.status(400).json({ error: "Number required" });
     num = num.replace(/[^0-9]/g, ''); 
 
     try {
-        if (!sock) await connectToWhatsApp();
+        // Purana session agar logged out hai to clear karein
+        if (sock) {
+            try { sock.logout(); } catch(e) {}
+        }
         
-        // Pairing code request
+        await connectToWhatsApp();
+        
+        // Thoda intezar taaki socket ready ho jaye
+        await new Promise(resolve => setTimeout(resolve, 3000));
+        
+        console.log(`Requesting code for: ${num}`);
         const code = await sock.requestPairingCode(num);
         res.json({ code: code });
-        console.log(`Code generated for: ${num}`);
+        
     } catch (err) {
-        console.error("Pairing Error:", err);
-        // Asli error dikhane ke liye
-        res.status(500).json({ error: err.message || "Failed to generate code" });
+        console.error("Critical Pairing Error:", err);
+        let msg = "FAILED TO GENERATE CODE";
+        if (err.message.includes("429")) msg = "TOO MANY REQUESTS. WAIT 5 MINUTES.";
+        if (err.message.includes("not-authorized")) msg = "SESSION ERROR. RESTART RAILWAY.";
+        res.status(500).json({ error: msg, detail: err.message });
     }
 });
 
@@ -68,17 +84,16 @@ app.get('/check', async (req, res) => {
     let num = req.query.number;
     if (!num) return res.status(400).json({ error: "Number required" });
     num = num.replace(/[^0-9]/g, '');
-
     try {
-        if (!sock || sock.ws.readyState !== 1) return res.json({ exists: false, error: "Not linked" });
+        if (!sock || sock.ws.readyState !== 1) return res.json({ exists: false, error: "Server Not Linked" });
         const [result] = await sock.onWhatsApp(num);
         res.json({ exists: !!(result && result.exists) });
     } catch (err) {
-        res.status(500).json({ error: "API Error" });
+        res.status(500).json({ error: "Check Failed" });
     }
 });
 
 app.listen(port, () => {
-    console.log(`Server started on ${port}`);
+    console.log(`TK TOOL Server running on port ${port}`);
     connectToWhatsApp();
 });
