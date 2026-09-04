@@ -1,7 +1,8 @@
 const { 
     default: makeWASocket, 
     useMultiFileAuthState,
-    DisconnectReason
+    DisconnectReason,
+    fetchLatestBaileysVersion
 } = require("@whiskeysockets/baileys");
 const express = require("express");
 const pino = require("pino");
@@ -13,18 +14,20 @@ const port = process.env.PORT || 3000;
 
 let sock;
 
-// Ye line "Cannot GET" ko khatam karegi
 app.get('/', (req, res) => {
     res.send("TK TOOL SERVER IS LIVE! PAIRING MODE ENABLED.");
 });
 
 async function connectToWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info_baileys');
+    const { version } = await fetchLatestBaileysVersion();
     
     sock = makeWASocket({
+        version,
         printQRInTerminal: false,
         auth: state,
-        logger: pino({ level: 'silent' })
+        logger: pino({ level: 'silent' }),
+        browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
     sock.ev.on('connection.update', (update) => {
@@ -38,24 +41,34 @@ async function connectToWhatsApp() {
     });
 
     sock.ev.on('creds.update', saveCreds);
+    return sock;
 }
 
 app.get('/get-code', async (req, res) => {
-    const num = req.query.number;
+    // Number ko saaf karna (remove +, spaces, dashes)
+    let num = req.query.number;
     if (!num) return res.status(400).json({ error: "Number required" });
+    num = num.replace(/[^0-9]/g, ''); 
+
     try {
         if (!sock) await connectToWhatsApp();
-        // Pairing code ki request
+        
+        // Pairing code request
         const code = await sock.requestPairingCode(num);
         res.json({ code: code });
+        console.log(`Code generated for: ${num}`);
     } catch (err) {
-        res.status(500).json({ error: "Try again in 60 seconds" });
+        console.error("Pairing Error:", err);
+        // Asli error dikhane ke liye
+        res.status(500).json({ error: err.message || "Failed to generate code" });
     }
 });
 
 app.get('/check', async (req, res) => {
-    const num = req.query.number;
+    let num = req.query.number;
     if (!num) return res.status(400).json({ error: "Number required" });
+    num = num.replace(/[^0-9]/g, '');
+
     try {
         if (!sock || sock.ws.readyState !== 1) return res.json({ exists: false, error: "Not linked" });
         const [result] = await sock.onWhatsApp(num);
