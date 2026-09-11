@@ -1,81 +1,104 @@
-const { default: makeWASocket, useMultiFileAuthState, delay, DisconnectReason } = require("@whiskeysockets/baileys");
+// 1. GLOBAL CRYPTO FIX
+if (!global.crypto) {
+    try {
+        global.crypto = require('crypto');
+    } catch (e) {
+        console.error("Failed to load crypto module");
+    }
+}
+
+const { 
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    delay, 
+    DisconnectReason,
+    fetchLatestBaileysVersion
+} = require("@whiskeysockets/baileys");
 const express = require("express");
 const pino = require("pino");
 const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-// Global variables taaki session zinda rahe
-let sock = null;
-let pairingCodeRequested = false;
+// Yahan hum check kar rahe hain ke /data folder exist karta hai ya nahi (Volume check)
+const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
 
-async function startWhatsApp(phoneNumber = null) {
-    const { state, saveCreds } = await useMultiFileAuthState('auth_info');
-    
+let sock = null;
+
+async function startWhatsApp() {
+    // Session files ko /data/auth_info folder mein store karega (jo ke aapki Volume hai)
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+    const { version } = await fetchLatestBaileysVersion();
+
+    console.log(`Starting WhatsApp on ${SESSION_PATH} with version: ${version.join('.')}`);
+
     sock = makeWASocket({
+        version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false, // Hum pairing code use karenge
+        printQRInTerminal: false,
         browser: ["Ubuntu", "Chrome", "20.0.04"]
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    sock.ev.on('connection.update', async (update) => {
+    sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
         
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('Connection closed. Reconnecting...', shouldReconnect);
-            if (shouldReconnect) startWhatsApp();
+            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+            if (shouldReconnect) {
+                console.log('Reconnecting...');
+                startWhatsApp();
+            }
         } else if (connection === 'open') {
-            console.log('✅ WhatsApp Linked Successfully!');
-            pairingCodeRequested = false;
+            console.log('✅ Success: WhatsApp Linked!');
         }
     });
 
     return sock;
 }
 
-// Pairing Code mangwane ka sahi tareeka
 app.get('/get-code', async (req, res) => {
-    const number = req.query.number;
+    let number = req.query.number;
     if (!number) return res.status(400).json({ error: "Number required" });
+    
+    number = number.replace(/\D/g, '');
 
     try {
-        // Purana session agar chal raha ho toh initialize karein
-        await startWhatsApp();
-        
-        // Thora intezar karein socket ready hone ka
-        await delay(3000);
+        // Force restart socket if it's not connected
+        if (!sock || !sock.user) {
+            await startWhatsApp();
+            await delay(5000);
+        }
 
-        if (sock && !sock.authState.creds.registered) {
-            const code = await sock.requestPairingCode(number.replace(/\+/g, ''));
-            console.log(`Pairing Code for ${number}: ${code}`);
-            res.json({ code: code });
+        if (sock) {
+            const code = await sock.requestPairingCode(number);
+            res.json({ code });
         } else {
-            res.json({ error: "Already registered or socket not ready" });
+            res.status(500).json({ error: "Socket error" });
         }
     } catch (err) {
         console.error("Pairing Error:", err);
-        res.status(500).json({ error: "Failed to get code. Try again." });
+        res.status(500).json({ error: err.message });
     }
 });
 
-// Check number status
 app.get('/check', async (req, res) => {
     const number = req.query.number;
-    if (!sock || !number) return res.status(400).json({ error: "Service not ready" });
+    if (!sock || !sock.user) return res.status(400).json({ error: "Not linked" });
 
     try {
         const [result] = await sock.onWhatsApp(number);
         res.json({ exists: !!result?.exists });
     } catch (err) {
-        res.status(500).json({ error: "Check failed" });
+        res.status(500).json({ error: "Failed" });
     }
 });
 
 app.listen(port, "0.0.0.0", () => {
-    console.log(`Server is running on port ${port}`);
+    console.log(`Server started. Volume Path: ${SESSION_PATH}`);
+    startWhatsApp().catch(console.error);
 });
