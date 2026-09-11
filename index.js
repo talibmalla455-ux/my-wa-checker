@@ -18,6 +18,7 @@ app.use(cors());
 app.use(express.json());
 const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
 let sock = null;
+let connectedUser = null;
 function clearSession() {
  try {
  if (fs.existsSync(SESSION_PATH)) {
@@ -28,13 +29,10 @@ function clearSession() {
  console.error("[ERROR]", e.message);
  }
 }
-async function initSocket() {
- if (sock) {
- console.log("[SKIP] Socket exists");
- return sock;
- }
- 
- console.log("[INIT] Starting WhatsApp...");
+async function connectWhatsApp() {
+ return new Promise(async (resolve, reject) => {
+ try {
+ console.log("[CONNECT] Initializing Baileys...");
  
  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
  const { version } = await fetchLatestBaileysVersion();
@@ -42,134 +40,162 @@ async function initSocket() {
  sock = makeWASocket({
  version,
  auth: state,
- logger: pino({ level: 'silent' }),
+ logger: pino({ level: 'fatal' }), // Only fatal errors
  printQRInTerminal: false,
  browser: ["Ubuntu", "Chrome", "20.0.04"],
- connectTimeoutMs: 25000,
- keepAliveIntervalMs: 15000,
+ connectTimeoutMs: 60000, // Increased to 60s
+ defaultQueryTimeoutMs: 60000,
+ keepAliveIntervalMs: 25000,
+ retryRequestDelayMs: 100,
+ maxRetries: 10,
+ qrTimeout: 60000,
+ shouldIgnoreJid: () => false,
  });
  
  sock.ev.on('creds.update', saveCreds);
  
+ let connectionOpened = false;
+ 
  sock.ev.on('connection.update', (update) => {
- const { connection, lastDisconnect, isNewLogin } = update;
+ const { connection, lastDisconnect, isNewLogin, qr } = update;
+ 
+ console.log(`[UPDATE] Connection: ${connection}`);
  
  if (connection === 'open') {
- console.log('✅ [LINKED] Device connected!');
- if (isNewLogin) {
- console.log('[USER]', sock.user.id);
- }
+ connectionOpened = true;
+ connectedUser = sock.user;
+ console.log('✅ [OPEN] Connected!');
+ resolve(sock);
+ } else if (connection === 'connecting') {
+ console.log('[CONNECTING] ...');
+ } else if (connection === 'close') {
+ const statusCode = lastDisconnect?.error?.output?.statusCode;
+ console.log(`[CLOSE] Status: ${statusCode}`);
+ 
+ if (!connectionOpened) {
+ reject(new Error(`Connection closed: ${statusCode}`));
  }
  
- if (connection === 'close') {
- const code = lastDisconnect?.error?.output?.statusCode;
- console.log(`[CLOSED] Code: ${code}`);
- 
- if (code === 401 || code === 403) {
- console.log('[LOGOUT] Session invalid');
+ if (statusCode === 401 || statusCode === 403) {
+ console.log('[LOGOUT] Clearing session');
  clearSession();
  sock = null;
  } else {
- console.log('[RECONNECT] After 5s...');
- setTimeout(() => {
  sock = null;
- initSocket().catch(console.error);
- }, 5000);
  }
  }
  });
  
- return sock;
+ // Overall timeout
+ setTimeout(() => {
+ if (!connectionOpened) {
+ reject(new Error("Connection timeout 50s"));
+ }
+ }, 50000);
+ 
+ } catch (err) {
+ console.error("[ERROR]", err.message);
+ reject(err);
+ }
+ });
 }
 app.get('/get-code', async (req, res) => {
- res.setTimeout(20000);
+ res.setTimeout(70000); // 70 seconds timeout
  
  try {
  const number = (req.query.number || '').replace(/\D/g, '');
  
- if (number.length < 10) {
+ if (!number || number.length < 10) {
  return res.status(400).json({ error: "Invalid number" });
  }
  
- console.log(`[REQUEST] Code for ${number}`);
+ console.log(`[REQUEST] ${number}`);
  
- // Initialize if needed
+ // Check if already linked
+ if (connectedUser) {
+ console.log('[LINKED] Already connected');
+ return res.json({ status: "already_linked", user: connectedUser.id });
+ }
+ 
+ // Connect
  if (!sock) {
- console.log('[CONNECT] Initializing socket...');
- sock = await Promise.race([
- initSocket(),
- new Promise((_, reject) => 
- setTimeout(() => reject(new Error("Init timeout")), 15000)
- )
- ]);
+ console.log('[INIT] Creating connection...');
+ try {
+ sock = await connectWhatsApp();
+ } catch (err) {
+ console.error('[CONNECT ERROR]', err.message);
+ sock = null;
+ return res.status(503).json({ 
+ error: err.message,
+ action: "Try /reset and wait 5 minutes"
+ });
+ }
  }
  
  // Safety check
- if (!sock || typeof sock.requestPairingCode !== 'function') {
- sock = null;
- return res.status(503).json({ error: "Socket error - try /reset" });
+ if (!sock) {
+ return res.status(503).json({ error: "Socket is null" });
  }
  
- // Already linked?
- if (sock.user) {
- return res.json({ status: "already_linked", user: sock.user.id });
- }
- 
- // Wait for WS ready
- let ready = false;
- for (let i = 0; i < 10; i++) {
+ // Wait for WS ready (max 15 seconds)
+ console.log('[WAIT] For WebSocket...');
+ let wsReady = false;
+ for (let i = 0; i < 15; i++) {
  if (sock.ws && sock.ws.readyState === 1) {
- ready = true;
+ wsReady = true;
+ console.log('[WS] Ready!');
  break;
  }
- await delay(500);
+ await delay(1000);
  }
  
- if (!ready) {
+ if (!wsReady) {
+ console.log('[WS] Not ready');
  sock = null;
- return res.status(503).json({ error: "Connection not ready" });
+ return res.status(503).json({ error: "WebSocket not ready - try /reset" });
  }
  
- await delay(800);
+ await delay(1000);
  
- // Get code
- console.log('[CODE] Requesting...');
+ // Request code
+ console.log('[CODE] Requesting pairing code...');
  const code = await Promise.race([
  sock.requestPairingCode(number),
  new Promise((_, reject) => 
- setTimeout(() => reject(new Error("Code timeout")), 8000)
+ setTimeout(() => reject(new Error("Pairing timeout")), 10000)
  )
  ]);
  
- console.log(`✅ [SUCCESS] Code: ${code}`);
+ console.log(`✅ [SUCCESS] ${code}`);
  
  return res.json({ 
  code: code,
- message: "Enter in WhatsApp Settings → Linked Devices in 60 seconds"
+ expire: "60 seconds"
  });
  
  } catch (err) {
- console.error(`[ERROR] ${err.message}`);
+ console.error('[ERROR]', err.message);
  sock = null;
+ connectedUser = null;
  
- res.status(503).json({ 
- error: err.message,
- tip: "Try /reset"
- });
+ if (!res.headersSent) {
+ res.status(503).json({ error: err.message });
+ }
  }
 });
 app.get('/status', (req, res) => {
  res.json({
- connected: sock?.user ? true : false,
- user: sock?.user?.id || "Not linked"
+ linked: connectedUser ? true : false,
+ user: connectedUser?.id || null
  });
 });
 app.get('/reset', (req, res) => {
  clearSession();
  sock = null;
- console.log("[RESET] Session cleared");
- res.json({ ok: true });
+ connectedUser = null;
+ console.log("[RESET] Done");
+ res.json({ ok: true, wait: "5 minutes" });
 });
 app.listen(port, "0.0.0.0", () => {
- console.log(`[SERVER] Running on port ${port}`);
+ console.log(`[SERVER] ${port}`);
 });
