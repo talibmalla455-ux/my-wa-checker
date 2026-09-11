@@ -1,13 +1,13 @@
 if (!global.crypto) {
-    try { global.crypto = require('crypto'); } catch (e) {}
+ try { global.crypto = require('crypto'); } catch (e) {}
 }
 
 const { 
-    default: makeWASocket, 
-    useMultiFileAuthState, 
-    delay, 
-    DisconnectReason,
-    fetchLatestBaileysVersion
+ default: makeWASocket, 
+ useMultiFileAuthState, 
+ delay, 
+ DisconnectReason,
+ fetchLatestBaileysVersion
 } = require("@whiskeysockets/baileys");
 const express = require("express");
 const cors = require("cors");
@@ -25,174 +25,170 @@ const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
 let sock = null;
 
 function clearSession() {
-    try {
-        if (fs.existsSync(SESSION_PATH)) {
-            fs.rmSync(SESSION_PATH, { recursive: true, force: true });
-            console.log("[SYSTEM] ✓ Session cleared.");
-        }
-    } catch (e) {
-        console.error("[ERROR] Clear failed:", e.message);
-    }
+ try {
+ if (fs.existsSync(SESSION_PATH)) {
+ fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+ console.log("[✓] Session cleared");
+ }
+ } catch (e) {
+ console.error("[ERROR] Clear failed:", e.message);
+ }
 }
 
-async function startWhatsApp() {
-    try {
-        console.log("[SYSTEM] Initializing WhatsApp...");
-        
-        const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
-        const { version } = await fetchLatestBaileysVersion();
+async function initSocket() {
+ try {
+ console.log("[INIT] Starting WhatsApp socket...");
+ 
+ const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+ const { version } = await fetchLatestBaileysVersion();
 
-        sock = makeWASocket({
-            version,
-            auth: state,
-            logger: pino({ level: 'silent' }),
-            printQRInTerminal: false,
-            browser: ["Ubuntu", "Chrome", "20.0.04"],
-            connectTimeoutMs: 20000,  // Reduced to 20s
-            defaultQueryTimeoutMs: 60000,
-            keepAliveIntervalMs: 20000,
-            retryRequestDelayMs: 100,
-            maxRetries: 3,
-            qrTimeout: 60000
-        });
+ sock = makeWASocket({
+ version,
+ auth: state,
+ logger: pino({ level: 'silent' }),
+ printQRInTerminal: false,
+ browser: ["Ubuntu", "Chrome", "20.0.04"],
+ connectTimeoutMs: 20000,
+ defaultQueryTimeoutMs: 60000,
+ keepAliveIntervalMs: 15000
+ });
 
-        sock.ev.on('creds.update', saveCreds);
+ sock.ev.on('creds.update', saveCreds);
 
-        return new Promise((resolve, reject) => {
-            const timeout = setTimeout(() => {
-                console.log("[ERROR] Connection timeout 25s exceeded");
-                reject(new Error("Connection timeout"));
-            }, 25000);
+ sock.ev.on('connection.update', async (update) => {
+ const { connection, lastDisconnect } = update;
+ 
+ if (connection === 'open') {
+ console.log('[✅] WhatsApp Connected!');
+ } else if (connection === 'close') {
+ const code = lastDisconnect?.error?.output?.statusCode;
+ console.log(`[CLOSE] Status: ${code}`);
+ 
+ if (code === 401 || code === 403) {
+ console.log("[LOGOUT] Invalid session, clearing...");
+ clearSession();
+ } else if (code === 428) {
+ console.log("[WAIT] WhatsApp throttling, wait 2 mins");
+ } else {
+ console.log("[RECONNECT] In 5s...");
+ setTimeout(initSocket, 5000);
+ }
+ }
+ });
 
-            sock.ev.on('connection.update', (update) => {
-                const { connection, lastDisconnect, qr } = update;
-                
-                if (qr) {
-                    console.log("[QR] QR code generated");
-                }
-                
-                if (connection === 'open') {
-                    clearTimeout(timeout);
-                    console.log('✅ [SUCCESS] WhatsApp Connected!');
-                    resolve(sock);
-                } else if (connection === 'close') {
-                    const statusCode = lastDisconnect?.error?.output?.statusCode;
-                    console.log(`[DISCONNECT] Status: ${statusCode}`);
-
-                    if (statusCode === 401 || statusCode === 403) {
-                        clearTimeout(timeout);
-                        console.log("[AUTH] Session invalid, clearing...");
-                        clearSession();
-                        reject(new Error("Session invalid"));
-                    } else if (statusCode === 428) {
-                        clearTimeout(timeout);
-                        console.log("[PRECONDITION] WhatsApp verification needed");
-                        reject(new Error("WhatsApp verification required - try later"));
-                    } else {
-                        console.log("[RETRY] Reconnecting in 3s...");
-                        setTimeout(() => startWhatsApp().then(resolve).catch(reject), 3000);
-                    }
-                }
-            });
-        });
-    } catch (err) {
-        console.error("[ERROR] Init failed:", err.message);
-        throw err;
-    }
+ return sock;
+ } catch (err) {
+ console.error("[ERROR] Socket init:", err.message);
+ throw err;
+ }
 }
 
 app.get('/get-code', async (req, res) => {
-    const timeout = setTimeout(() => {
-        console.log("[TIMEOUT] Request exceeded 10s");
-        if (!res.headersSent) {
-            res.status(504).json({ error: "Timeout - try again" });
-        }
-    }, 10000);
+ const reqTimeout = setTimeout(() => {
+ if (!res.headersSent) {
+ res.status(504).json({ error: "Timeout - try again" });
+ }
+ }, 10000);
 
-    try {
-        let number = req.query.number;
-        if (!number) {
-            clearTimeout(timeout);
-            return res.status(400).json({ error: "Number required: ?number=923001234567" });
-        }
+ try {
+ let number = req.query.number;
+ 
+ if (!number) {
+ clearTimeout(reqTimeout);
+ return res.status(400).json({ error: "?number=923001234567" });
+ }
 
-        number = number.replace(/\D/g, '');
-        if (number.length < 10) {
-            clearTimeout(timeout);
-            return res.status(400).json({ error: "Invalid number" });
-        }
+ // Clean number - sirf digits
+ number = number.replace(/\D/g, '');
 
-        console.log(`[REQUEST] Code for ${number}`);
+ if (number.length < 10) {
+ clearTimeout(reqTimeout);
+ return res.status(400).json({ error: "Invalid number" });
+ }
 
-        if (sock?.user) {
-            clearTimeout(timeout);
-            return res.json({ status: "already_linked", user: sock.user.id });
-        }
+ console.log(`[REQUEST] Pairing code for: ${number}`);
 
-        if (!sock || sock.ws?.readyState !== 1) {
-            console.log("[INIT] Connecting...");
-            try {
-                await startWhatsApp();
-            } catch (err) {
-                clearTimeout(timeout);
-                console.error("[INIT ERROR]", err.message);
-                return res.status(503).json({ 
-                    error: err.message,
-                    suggestion: "Try /reset endpoint or wait 2 minutes"
-                });
-            }
-        }
+ // Agar pehle se linked hai
+ if (sock?.user) {
+ clearTimeout(reqTimeout);
+ return res.json({ 
+ status: "already_linked",
+ user: sock.user.id
+ });
+ }
 
-        // Wait for ready
-        let ready = false;
-        for (let i = 0; i < 5; i++) {
-            if (sock.ws?.readyState === 1) {
-                ready = true;
-                break;
-            }
-            await delay(1000);
-        }
+ // Socket init karo agar nahi hai
+ if (!sock) {
+ console.log("[CONNECT] Initializing...");
+ sock = await initSocket();
+ }
 
-        if (ready) {
-            await delay(500);
-            const code = await Promise.race([
-                sock.requestPairingCode(number),
-                new Promise((_, rej) => setTimeout(() => rej(new Error("Pairing timeout")), 5000))
-            ]);
+ // Wait for connection - max 5 seconds
+ let connected = false;
+ for (let i = 0; i < 5; i++) {
+ if (sock.ws?.readyState === 1) {
+ connected = true;
+ break;
+ }
+ await delay(1000);
+ }
 
-            clearTimeout(timeout);
-            console.log(`✅ Code ready: ${code}`);
-            return res.json({ status: "success", code });
-        } else {
-            throw new Error("Connection not ready");
-        }
+ if (!connected) {
+ throw new Error("Connection timeout - try again");
+ }
 
-    } catch (err) {
-        clearTimeout(timeout);
-        console.error("[ERROR]", err.message);
-        if (!res.headersSent) {
-            res.status(500).json({ error: err.message });
-        }
-    }
+ // Small delay
+ await delay(500);
+
+ // **PAIRING CODE GENERATE KARO**
+ console.log("[CODE] Requesting pairing code...");
+ const code = await Promise.race([
+ sock.requestPairingCode(number),
+ new Promise((_, reject) => 
+ setTimeout(() => reject(new Error("Code timeout")), 6000)
+ )
+ ]);
+
+ clearTimeout(reqTimeout);
+ console.log(`[✅] Code: ${code}`);
+
+ return res.json({ 
+ status: "success",
+ code: code,
+ number: number,
+ message: "Pairing code generated - WhatsApp mein enter karo"
+ });
+
+ } catch (err) {
+ clearTimeout(reqTimeout);
+ console.error("[ERROR]", err.message);
+
+ if (!res.headersSent) {
+ res.status(500).json({ 
+ error: err.message,
+ tip: "Try /reset and wait 2 minutes"
+ });
+ }
+ }
 });
 
 app.get('/health', (req, res) => {
-    res.json({
-        server: "online",
-        whatsapp: sock?.user ? "connected" : "disconnected"
-    });
+ res.json({
+ online: true,
+ whatsapp: sock?.user ? "connected" : "not_connected"
+ });
 });
 
 app.get('/reset', (req, res) => {
-    clearSession();
-    sock = null;
-    console.log("[RESET] Session cleared");
-    res.json({ status: "reset" });
+ clearSession();
+ sock = null;
+ console.log("[RESET] Session cleared - wait 2 mins");
+ res.json({ status: "ok", message: "Wait 2 minutes pehle request karna" });
 });
 
 app.listen(port, "0.0.0.0", () => {
-    console.log(`[SERVER] Port ${port}`);
-    startWhatsApp().catch(() => {
-        console.log("[STARTUP] Will init on first request");
-    });
+ console.log(`[SERVER] http://0.0.0.0:${port}`);
+ initSocket().catch(() => {
+ console.log("[READY] Init on first request");
+ });
 });
