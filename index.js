@@ -1,10 +1,5 @@
-// 1. GLOBAL CRYPTO FIX
 if (!global.crypto) {
-    try {
-        global.crypto = require('crypto');
-    } catch (e) {
-        console.error("Failed to load crypto module");
-    }
+    try { global.crypto = require('crypto'); } catch (e) {}
 }
 
 const { 
@@ -15,7 +10,7 @@ const {
     fetchLatestBaileysVersion
 } = require("@whiskeysockets/baileys");
 const express = require("express");
-const cors = require("cors"); // CORS library
+const cors = require("cors");
 const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
@@ -23,20 +18,16 @@ const path = require("path");
 const app = express();
 const port = process.env.PORT || 3000;
 
-// CORS ko enable karein taaki app data fetch kar sake
 app.use(cors());
 app.use(express.json());
 
-// Volume path check (/data volume mounted hai ya nahi)
 const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
-
 let sock = null;
+let isWsReady = false; // Connection status track karne ke liye
 
 async function startWhatsApp() {
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
     const { version } = await fetchLatestBaileysVersion();
-
-    console.log(`Starting WhatsApp on ${SESSION_PATH}`);
 
     sock = makeWASocket({
         version,
@@ -50,11 +41,27 @@ async function startWhatsApp() {
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
+        
+        if (connection === 'connecting') {
+            isWsReady = false;
+            console.log("Connecting to WhatsApp...");
+        }
+
+        if (connection === 'open') {
+            isWsReady = true;
+            console.log('✅ WhatsApp Linked!');
+        }
+
         if (connection === 'close') {
+            isWsReady = false;
             const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
             if (shouldReconnect) startWhatsApp();
-        } else if (connection === 'open') {
-            console.log('✅ WhatsApp Linked!');
+        }
+        
+        // Agar QR ya connecting state mein hai, toh hum messages bhej sakte hain
+        // isWsReady ko hum true kar sakte hain agar socket open hai
+        if(sock?.ws?.readyState === 1) {
+            isWsReady = true;
         }
     });
 
@@ -67,15 +74,31 @@ app.get('/get-code', async (req, res) => {
     number = number.replace(/\D/g, '');
 
     try {
-        if (!sock || !sock.user) {
+        // Socket initialization agar zarurat ho
+        if (!sock) {
             await startWhatsApp();
-            await delay(5000);
         }
-        const code = await sock.requestPairingCode(number);
-        res.json({ code });
+
+        // Wait loop: Jab tak connection ready nahi hoti (max 15 seconds)
+        let attempts = 0;
+        while (!isWsReady && sock?.ws?.readyState !== 1 && attempts < 15) {
+            console.log("Waiting for socket to be ready...");
+            await delay(1000);
+            attempts++;
+        }
+
+        if (sock?.ws?.readyState === 1 || isWsReady) {
+            console.log(`Requesting code for ${number}...`);
+            const code = await sock.requestPairingCode(number);
+            res.json({ code });
+        } else {
+            throw new Error("Connection Timeout: WhatsApp server not responding.");
+        }
     } catch (err) {
         console.error("Pairing Error:", err);
-        res.status(500).json({ error: err.message });
+        // Agar connection close ho gayi ho toh reset karein
+        sock = null; 
+        res.status(500).json({ error: err.message || "Connection Closed. Please try again." });
     }
 });
 
@@ -91,6 +114,6 @@ app.get('/check', async (req, res) => {
 });
 
 app.listen(port, "0.0.0.0", () => {
-    console.log(`Server running on port ${port}`);
+    console.log(`Server running on port ${port}. Volume: ${SESSION_PATH}`);
     startWhatsApp().catch(console.error);
 });
