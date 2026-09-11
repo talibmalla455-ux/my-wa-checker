@@ -18,7 +18,7 @@ app.use(cors());
 app.use(express.json());
 const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
 let sock = null;
-let connectedUser = null;
+let isConnecting = false;
 function clearSession() {
  try {
  if (fs.existsSync(SESSION_PATH)) {
@@ -29,10 +29,25 @@ function clearSession() {
  console.error("[ERROR]", e.message);
  }
 }
-async function connectWhatsApp() {
- return new Promise(async (resolve, reject) => {
+async function createConnection() {
+ if (sock) return sock;
+ if (isConnecting) {
+ console.log("[WAIT] Already connecting...");
+ return new Promise(resolve => {
+ const check = setInterval(() => {
+ if (sock) {
+ clearInterval(check);
+ resolve(sock);
+ }
+ }, 500);
+ setTimeout(() => clearInterval(check), 30000);
+ });
+ }
+ 
+ isConnecting = true;
+ 
  try {
- console.log("[CONNECT] Initializing Baileys...");
+ console.log("[INIT] Creating socket...");
  
  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
  const { version } = await fetchLatestBaileysVersion();
@@ -40,161 +55,141 @@ async function connectWhatsApp() {
  sock = makeWASocket({
  version,
  auth: state,
- logger: pino({ level: 'fatal' }), // Only fatal errors
- printQRInTerminal: false,
+ logger: pino({ level: 'error' }),
  browser: ["Ubuntu", "Chrome", "20.0.04"],
- connectTimeoutMs: 60000, // Increased to 60s
- defaultQueryTimeoutMs: 60000,
+ connectTimeoutMs: 30000,
  keepAliveIntervalMs: 25000,
- retryRequestDelayMs: 100,
- maxRetries: 10,
- qrTimeout: 60000,
- shouldIgnoreJid: () => false,
  });
  
  sock.ev.on('creds.update', saveCreds);
  
- let connectionOpened = false;
- 
  sock.ev.on('connection.update', (update) => {
- const { connection, lastDisconnect, isNewLogin, qr } = update;
- 
- console.log(`[UPDATE] Connection: ${connection}`);
+ const { connection, lastDisconnect, isNewLogin } = update;
  
  if (connection === 'open') {
- connectionOpened = true;
- connectedUser = sock.user;
- console.log('✅ [OPEN] Connected!');
- resolve(sock);
- } else if (connection === 'connecting') {
- console.log('[CONNECTING] ...');
- } else if (connection === 'close') {
- const statusCode = lastDisconnect?.error?.output?.statusCode;
- console.log(`[CLOSE] Status: ${statusCode}`);
- 
- if (!connectionOpened) {
- reject(new Error(`Connection closed: ${statusCode}`));
+ console.log('✅ [OPEN]');
+ isConnecting = false;
  }
  
- if (statusCode === 401 || statusCode === 403) {
- console.log('[LOGOUT] Clearing session');
- clearSession();
+ if (connection === 'close') {
+ const code = lastDisconnect?.error?.output?.statusCode;
+ console.log(`[CLOSE] ${code}`);
+ isConnecting = false;
  sock = null;
- } else {
- sock = null;
+ 
+ if (code !== 401 && code !== 403) {
+ setTimeout(createConnection, 3000);
  }
  }
  });
  
- // Overall timeout
- setTimeout(() => {
- if (!connectionOpened) {
- reject(new Error("Connection timeout 50s"));
+ // Wait max 25 seconds for connection
+ await new Promise((resolve, reject) => {
+ const timeout = setTimeout(() => {
+ reject(new Error("Connection timeout"));
+ }, 25000);
+ 
+ const checkInterval = setInterval(() => {
+ if (sock?.ws?.readyState === 1) {
+ clearTimeout(timeout);
+ clearInterval(checkInterval);
+ resolve();
  }
- }, 50000);
+ }, 500);
+ });
+ 
+ return sock;
  
  } catch (err) {
  console.error("[ERROR]", err.message);
- reject(err);
+ isConnecting = false;
+ sock = null;
+ throw err;
  }
- });
 }
 app.get('/get-code', async (req, res) => {
- res.setTimeout(70000); // 70 seconds timeout
+ res.setTimeout(40000);
  
  try {
  const number = (req.query.number || '').replace(/\D/g, '');
  
- if (!number || number.length < 10) {
+ if (number.length < 10) {
  return res.status(400).json({ error: "Invalid number" });
  }
  
  console.log(`[REQUEST] ${number}`);
  
- // Check if already linked
- if (connectedUser) {
- console.log('[LINKED] Already connected');
- return res.json({ status: "already_linked", user: connectedUser.id });
- }
- 
  // Connect
  if (!sock) {
- console.log('[INIT] Creating connection...');
+ console.log('[CONNECT]');
  try {
- sock = await connectWhatsApp();
+ sock = await createConnection();
  } catch (err) {
- console.error('[CONNECT ERROR]', err.message);
+ console.error('[ERROR]', err.message);
  sock = null;
  return res.status(503).json({ 
- error: err.message,
- action: "Try /reset and wait 5 minutes"
+ error: "Cannot connect",
+ try: "/reset"
  });
  }
  }
  
- // Safety check
+ // Check socket
  if (!sock) {
- return res.status(503).json({ error: "Socket is null" });
+ return res.status(503).json({ error: "Socket null" });
  }
  
- // Wait for WS ready (max 15 seconds)
- console.log('[WAIT] For WebSocket...');
- let wsReady = false;
+ // Wait for ready
+ let ready = false;
  for (let i = 0; i < 15; i++) {
- if (sock.ws && sock.ws.readyState === 1) {
- wsReady = true;
- console.log('[WS] Ready!');
+ if (sock.ws?.readyState === 1) {
+ ready = true;
  break;
  }
  await delay(1000);
  }
  
- if (!wsReady) {
- console.log('[WS] Not ready');
+ if (!ready) {
  sock = null;
- return res.status(503).json({ error: "WebSocket not ready - try /reset" });
+ return res.status(503).json({ error: "Timeout" });
  }
  
- await delay(1000);
+ await delay(500);
  
- // Request code
- console.log('[CODE] Requesting pairing code...');
+ // Code
+ try {
+ console.log('[CODE]');
  const code = await Promise.race([
  sock.requestPairingCode(number),
  new Promise((_, reject) => 
- setTimeout(() => reject(new Error("Pairing timeout")), 10000)
+ setTimeout(() => reject(new Error("Timeout")), 8000)
  )
  ]);
  
- console.log(`✅ [SUCCESS] ${code}`);
- 
- return res.json({ 
- code: code,
- expire: "60 seconds"
- });
+ console.log(`✅ ${code}`);
+ return res.json({ code });
  
  } catch (err) {
- console.error('[ERROR]', err.message);
- sock = null;
- connectedUser = null;
- 
- if (!res.headersSent) {
- res.status(503).json({ error: err.message });
+ console.error('[CODE ERROR]', err.message);
+ throw err;
  }
+ 
+ } catch (err) {
+ console.error('[HANDLER ERROR]', err.message);
+ res.status(503).json({ error: err.message });
  }
 });
 app.get('/status', (req, res) => {
- res.json({
- linked: connectedUser ? true : false,
- user: connectedUser?.id || null
+ res.json({ 
+ connected: sock?.user ? true : false 
  });
 });
 app.get('/reset', (req, res) => {
  clearSession();
  sock = null;
- connectedUser = null;
- console.log("[RESET] Done");
- res.json({ ok: true, wait: "5 minutes" });
+ isConnecting = false;
+ console.log("[RESET]");
+ res.json({ ok: true });
 });
 app.listen(port, "0.0.0.0", () => {
  console.log(`[SERVER] ${port}`);
