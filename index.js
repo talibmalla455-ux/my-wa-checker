@@ -1,7 +1,6 @@
 if (!global.crypto) {
  try { global.crypto = require('crypto'); } catch (e) {}
 }
-
 const { 
  default: makeWASocket, 
  useMultiFileAuthState, 
@@ -13,35 +12,28 @@ const express = require("express");
 const cors = require("cors");
 const pino = require("pino");
 const fs = require("fs");
-
 const app = express();
 const port = process.env.PORT || 3000;
-
 app.use(cors());
 app.use(express.json());
-
 const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
-
 let sock = null;
-let connectionPromise = null;
-
 function clearSession() {
  try {
  if (fs.existsSync(SESSION_PATH)) {
  fs.rmSync(SESSION_PATH, { recursive: true, force: true });
- console.log("[✓] Session deleted");
+ console.log("[✓] Session cleared");
  }
  } catch (e) {
- console.error("[ERROR] Clear:", e.message);
+ console.error("[ERROR]", e.message);
  }
 }
-
 async function initSocket() {
- if (sock) return sock; // Already exists
- if (connectionPromise) return connectionPromise; // Already connecting
+ if (sock) {
+ console.log("[SKIP] Socket exists");
+ return sock;
+ }
  
- connectionPromise = (async () => {
- try {
  console.log("[INIT] Starting WhatsApp...");
  
  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
@@ -59,87 +51,62 @@ async function initSocket() {
  
  sock.ev.on('creds.update', saveCreds);
  
- sock.ev.on('connection.update', async (update) => {
+ sock.ev.on('connection.update', (update) => {
  const { connection, lastDisconnect, isNewLogin } = update;
  
  if (connection === 'open') {
- console.log('✅ [LINKED] Success!');
+ console.log('✅ [LINKED] Device connected!');
  if (isNewLogin) {
  console.log('[USER]', sock.user.id);
  }
- } 
+ }
  
  if (connection === 'close') {
  const code = lastDisconnect?.error?.output?.statusCode;
- console.log(`[CLOSE] Code: ${code}`);
+ console.log(`[CLOSED] Code: ${code}`);
  
+ if (code === 401 || code === 403) {
+ console.log('[LOGOUT] Session invalid');
+ clearSession();
  sock = null;
- connectionPromise = null;
- 
- if (code !== 401 && code !== 403) {
- // Reconnect after delay
+ } else {
+ console.log('[RECONNECT] After 5s...');
  setTimeout(() => {
- console.log('[RECONNECT] Trying...');
+ sock = null;
  initSocket().catch(console.error);
  }, 5000);
  }
  }
  });
  
- // Wait for connection
- await new Promise((resolve, reject) => {
- const timeout = setTimeout(() => {
- reject(new Error("Connection timeout"));
- }, 20000);
- 
- sock.ev.once('connection.update', (update) => {
- if (update.connection === 'open') {
- clearTimeout(timeout);
- resolve();
- }
- });
- });
- 
  return sock;
- 
- } catch (err) {
- console.error("[ERROR]", err.message);
- sock = null;
- connectionPromise = null;
- throw err;
- }
- })();
- 
- return connectionPromise;
 }
-
 app.get('/get-code', async (req, res) => {
- res.setTimeout(18000);
+ res.setTimeout(20000);
  
  try {
  const number = (req.query.number || '').replace(/\D/g, '');
  
  if (number.length < 10) {
- return res.status(400).json({ error: "Number invalid" });
+ return res.status(400).json({ error: "Invalid number" });
  }
  
- console.log(`[REQUEST] ${number}`);
+ console.log(`[REQUEST] Code for ${number}`);
  
- // Initialize socket
- try {
+ // Initialize if needed
+ if (!sock) {
+ console.log('[CONNECT] Initializing socket...');
  sock = await Promise.race([
  initSocket(),
  new Promise((_, reject) => 
  setTimeout(() => reject(new Error("Init timeout")), 15000)
  )
  ]);
- } catch (err) {
- console.error("[INIT ERROR]", err.message);
- return res.status(503).json({ error: "Cannot connect to WhatsApp - try /reset" });
  }
  
- // Check socket exists
- if (!sock || !sock.requestPairingCode) {
+ // Safety check
+ if (!sock || typeof sock.requestPairingCode !== 'function') {
+ sock = null;
  return res.status(503).json({ error: "Socket error - try /reset" });
  }
  
@@ -148,16 +115,25 @@ app.get('/get-code', async (req, res) => {
  return res.json({ status: "already_linked", user: sock.user.id });
  }
  
- // Wait for ready
+ // Wait for WS ready
+ let ready = false;
  for (let i = 0; i < 10; i++) {
- if (sock.ws?.readyState === 1) break;
+ if (sock.ws && sock.ws.readyState === 1) {
+ ready = true;
+ break;
+ }
  await delay(500);
  }
  
- await delay(500);
+ if (!ready) {
+ sock = null;
+ return res.status(503).json({ error: "Connection not ready" });
+ }
  
- // Request code
- console.log('[CODE] Generating...');
+ await delay(800);
+ 
+ // Get code
+ console.log('[CODE] Requesting...');
  const code = await Promise.race([
  sock.requestPairingCode(number),
  new Promise((_, reject) => 
@@ -165,35 +141,35 @@ app.get('/get-code', async (req, res) => {
  )
  ]);
  
- console.log(`✅ [SUCCESS] ${code}`);
+ console.log(`✅ [SUCCESS] Code: ${code}`);
  
- res.json({ 
- status: "success",
+ return res.json({ 
  code: code,
- message: "Enter in WhatsApp in 60 seconds"
+ message: "Enter in WhatsApp Settings → Linked Devices in 60 seconds"
  });
  
  } catch (err) {
  console.error(`[ERROR] ${err.message}`);
- res.status(503).json({ error: err.message });
+ sock = null;
+ 
+ res.status(503).json({ 
+ error: err.message,
+ tip: "Try /reset"
+ });
  }
 });
-
 app.get('/status', (req, res) => {
  res.json({
- linked: sock?.user ? true : false,
- user: sock?.user?.id || null
+ connected: sock?.user ? true : false,
+ user: sock?.user?.id || "Not linked"
  });
 });
-
 app.get('/reset', (req, res) => {
  clearSession();
  sock = null;
- connectionPromise = null;
- console.log("[RESET]");
- res.json({ ok: true, message: "Cleared - wait 5 minutes" });
+ console.log("[RESET] Session cleared");
+ res.json({ ok: true });
 });
-
 app.listen(port, "0.0.0.0", () => {
- console.log(`[SERVER] Port ${port}`);
+ console.log(`[SERVER] Running on port ${port}`);
 });
