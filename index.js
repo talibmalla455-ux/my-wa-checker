@@ -18,36 +18,17 @@ app.use(cors());
 app.use(express.json());
 const SESSION_PATH = fs.existsSync('/data') ? '/data/auth_info' : './auth_info';
 let sock = null;
-let isConnecting = false;
+let phoneConnected = false;
 function clearSession() {
  try {
  if (fs.existsSync(SESSION_PATH)) {
  fs.rmSync(SESSION_PATH, { recursive: true, force: true });
- console.log("[✓] Session cleared");
+ console.log("[✓] Cleared");
  }
- } catch (e) {
- console.error("[ERROR]", e.message);
- }
+ } catch (e) {}
 }
-async function createConnection() {
- if (sock) return sock;
- if (isConnecting) {
- console.log("[WAIT] Already connecting...");
- return new Promise(resolve => {
- const check = setInterval(() => {
- if (sock) {
- clearInterval(check);
- resolve(sock);
- }
- }, 500);
- setTimeout(() => clearInterval(check), 30000);
- });
- }
- 
- isConnecting = true;
- 
- try {
- console.log("[INIT] Creating socket...");
+async function initWhatsApp() {
+ console.log("[INIT] Starting...");
  
  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
  const { version } = await fetchLatestBaileysVersion();
@@ -57,58 +38,98 @@ async function createConnection() {
  auth: state,
  logger: pino({ level: 'error' }),
  browser: ["Ubuntu", "Chrome", "20.0.04"],
- connectTimeoutMs: 30000,
- keepAliveIntervalMs: 25000,
+ connectTimeoutMs: 20000,
+ keepAliveIntervalMs: 20000,
+ syncFullHistory: false,
  });
  
  sock.ev.on('creds.update', saveCreds);
  
- sock.ev.on('connection.update', (update) => {
+ sock.ev.on('connection.update', async (update) => {
  const { connection, lastDisconnect, isNewLogin } = update;
  
  if (connection === 'open') {
- console.log('✅ [OPEN]');
- isConnecting = false;
+ console.log('✅ [CONNECTED]');
+ phoneConnected = true;
  }
  
  if (connection === 'close') {
  const code = lastDisconnect?.error?.output?.statusCode;
- console.log(`[CLOSE] ${code}`);
- isConnecting = false;
- sock = null;
+ console.log(`[CLOSED] ${code}`);
+ phoneConnected = false;
  
- if (code !== 401 && code !== 403) {
- setTimeout(createConnection, 3000);
+ if (code === 401 || code === 403) {
+ clearSession();
+ sock = null;
+ } else if (code !== 408) {
+ setTimeout(initWhatsApp, 3000);
  }
  }
  });
  
- // Wait max 25 seconds for connection
- await new Promise((resolve, reject) => {
- const timeout = setTimeout(() => {
- reject(new Error("Connection timeout"));
- }, 25000);
- 
- const checkInterval = setInterval(() => {
+ return new Promise((resolve) => {
+ const checkReady = setInterval(() => {
  if (sock?.ws?.readyState === 1) {
- clearTimeout(timeout);
- clearInterval(checkInterval);
- resolve();
+ clearInterval(checkReady);
+ resolve(sock);
  }
  }, 500);
+ 
+ setTimeout(() => {
+ clearInterval(checkReady);
+ resolve(sock);
+ }, 20000);
+ });
+}
+app.get('/start', async (req, res) => {
+ res.setTimeout(30000);
+ 
+ try {
+ console.log('[START] Request');
+ 
+ // Already linked?
+ if (phoneConnected && sock?.user) {
+ return res.json({ 
+ status: "already_linked",
+ user: sock.user.id
+ });
+ }
+ 
+ // Initialize
+ if (!sock) {
+ console.log('[CONNECT]');
+ sock = await initWhatsApp();
+ }
+ 
+ // Wait for ready
+ let ready = false;
+ for (let i = 0; i < 15; i++) {
+ if (sock?.ws?.readyState === 1 && phoneConnected) {
+ ready = true;
+ break;
+ }
+ await delay(1000);
+ }
+ 
+ if (!ready) {
+ return res.json({
+ status: "connecting",
+ message: "Keep phone connected to WhatsApp"
+ });
+ }
+ 
+ return res.json({
+ status: "ready",
+ user: sock.user?.id || "connected"
  });
  
- return sock;
- 
  } catch (err) {
- console.error("[ERROR]", err.message);
- isConnecting = false;
- sock = null;
- throw err;
+ console.error('[ERROR]', err.message);
+ res.status(503).json({ error: err.message });
  }
-}
-app.get('/get-code', async (req, res) => {
- res.setTimeout(40000);
+});
+app.get('/pair-code', async (req, res) => {
+ res.setTimeout(25000);
  
  try {
  const number = (req.query.number || '').replace(/\D/g, '');
@@ -117,48 +138,29 @@ app.get('/get-code', async (req, res) => {
  return res.status(400).json({ error: "Invalid number" });
  }
  
- console.log(`[REQUEST] ${number}`);
+ console.log(`[PAIR] ${number}`);
  
- // Connect
- if (!sock) {
- console.log('[CONNECT]');
- try {
- sock = await createConnection();
- } catch (err) {
- console.error('[ERROR]', err.message);
- sock = null;
- return res.status(503).json({ 
- error: "Cannot connect",
- try: "/reset"
- });
- }
+ // Already linked?
+ if (phoneConnected && sock?.user) {
+ return res.json({ status: "already_linked" });
  }
  
- // Check socket
+ // Initialize
  if (!sock) {
- return res.status(503).json({ error: "Socket null" });
+ console.log('[INIT]');
+ sock = await initWhatsApp();
  }
  
  // Wait for ready
- let ready = false;
  for (let i = 0; i < 15; i++) {
- if (sock.ws?.readyState === 1) {
- ready = true;
- break;
- }
+ if (sock?.ws?.readyState === 1) break;
  await delay(1000);
- }
- 
- if (!ready) {
- sock = null;
- return res.status(503).json({ error: "Timeout" });
  }
  
  await delay(500);
  
- // Code
- try {
- console.log('[CODE]');
+ // Request code
+ console.log('[CODE] Requesting...');
  const code = await Promise.race([
  sock.requestPairingCode(number),
  new Promise((_, reject) => 
@@ -167,30 +169,36 @@ app.get('/get-code', async (req, res) => {
  ]);
  
  console.log(`✅ ${code}`);
- return res.json({ code });
+ 
+ // Start listening for connection
+ console.log('[LISTEN] For device link...');
+ 
+ return res.json({ 
+ code: code,
+ message: "Enter in WhatsApp",
+ expires_in: 60
+ });
  
  } catch (err) {
- console.error('[CODE ERROR]', err.message);
- throw err;
- }
- 
- } catch (err) {
- console.error('[HANDLER ERROR]', err.message);
+ console.error('[ERROR]', err.message);
  res.status(503).json({ error: err.message });
  }
 });
-app.get('/status', (req, res) => {
- res.json({ 
- connected: sock?.user ? true : false 
+app.get('/check', (req, res) => {
+ res.json({
+ connected: phoneConnected,
+ user: sock?.user?.id || null,
+ message: phoneConnected ? "Ready!" : "Not connected"
  });
 });
 app.get('/reset', (req, res) => {
  clearSession();
  sock = null;
- isConnecting = false;
+ phoneConnected = false;
  console.log("[RESET]");
  res.json({ ok: true });
 });
 app.listen(port, "0.0.0.0", () => {
  console.log(`[SERVER] ${port}`);
+ initWhatsApp().catch(() => console.log("[READY] Init on request"));
 });
