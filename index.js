@@ -5,13 +5,13 @@ if (!global.crypto) {
 const { 
  default: makeWASocket, 
  useMultiFileAuthState, 
- delay
+ delay,
+ fetchLatestBaileysVersion
 } = require("@whiskeysockets/baileys");
 const express = require("express");
 const cors = require("cors");
 const pino = require("pino");
 const fs = require("fs");
-const path = require("path");
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -22,150 +22,152 @@ app.use(express.json());
 const SESSION_PATH = fs.existsSync('/data') ? '/data/auth' : './auth';
 
 let sock = null;
-let qrGenerated = null;
+let connectionReady = false;
 
 function clearSession() {
  try {
  if (fs.existsSync(SESSION_PATH)) {
  fs.rmSync(SESSION_PATH, { recursive: true, force: true });
- console.log("[✓] Session cleared");
+ console.log("[✓] Cleared");
  }
- } catch (e) {
- console.error("[ERROR]", e.message);
- }
+ } catch (e) {}
 }
 
-async function connectWA() {
- return new Promise(async (resolve, reject) => {
- try {
- console.log("[CONNECT] Initializing...");
+async function startSocket() {
+ console.log("[START] Socket...");
  
  const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+ const { version } = await fetchLatestBaileysVersion();
  
  sock = makeWASocket({
+ version,
  auth: state,
- logger: pino({ level: 'fatal' }),
+ logger: pino({ level: 'error' }),
  browser: ["Ubuntu", "Chrome", "20.0.04"],
- connectTimeoutMs: 30000,
- keepAliveIntervalMs: 25000,
- defaultQueryTimeoutMs: 30000,
+ connectTimeoutMs: 20000,
+ keepAliveIntervalMs: 20000,
  syncFullHistory: false,
- printQRInTerminal: false,
  });
  
  sock.ev.on('creds.update', saveCreds);
  
- let opened = false;
- 
  sock.ev.on('connection.update', (update) => {
- const { connection, lastDisconnect, qr, isNewLogin } = update;
- 
- if (qr) {
- console.log('[QR] Generated');
- qrGenerated = qr;
- }
+ const { connection, lastDisconnect, isNewLogin } = update;
  
  if (connection === 'open') {
- opened = true;
- console.log('✅ [OPEN]');
- resolve(sock);
- } else if (connection === 'close') {
+ connectionReady = true;
+ console.log('✅ [READY]');
+ }
+ 
+ if (connection === 'close') {
  const code = lastDisconnect?.error?.output?.statusCode;
  console.log(`[CLOSE] ${code}`);
- 
- if (!opened) {
- reject(new Error(`Close: ${code}`));
- }
+ connectionReady = false;
  sock = null;
+ 
+ if (code !== 401 && code !== 403 && code !== 405) {
+ setTimeout(startSocket, 5000);
+ }
  }
  });
  
- setTimeout(() => {
- if (!opened && !qrGenerated) {
- reject(new Error("Timeout"));
- }
- }, 25000);
- 
- } catch (err) {
- console.error("[ERROR]", err.message);
- reject(err);
- }
- });
+ return sock;
 }
 
-// Main endpoint - bilkul simple
-app.get('/connect', async (req, res) => {
- res.setTimeout(35000);
+// MAIN ENDPOINT
+app.get('/pair', async (req, res) => {
+ res.setTimeout(30000);
  
  try {
  const number = (req.query.number || '').replace(/\D/g, '');
  
- if (number.length < 10) {
- return res.status(400).json({ error: "Invalid number" });
+ if (!number || number.length < 10) {
+ return res.status(400).json({ error: "Invalid number. Example: 923497181963" });
  }
  
- console.log(`[REQUEST] ${number}`);
+ console.log(`[PAIR] ${number}`);
  
+ // Start socket if needed
  if (!sock) {
  console.log('[INIT]');
- try {
- sock = await connectWA();
- } catch (err) {
- console.error('[CONNECT ERROR]', err.message);
- sock = null;
- return res.status(503).json({ error: err.message });
- }
+ sock = await startSocket();
  }
  
- // Wait for socket ready
- for (let i = 0; i < 20; i++) {
- if (sock?.ws?.readyState === 1) break;
+ // Wait for socket to be ready (max 15 seconds)
+ for (let i = 0; i < 15; i++) {
+ if (sock?.ws?.readyState === 1) {
+ console.log('[WS] Ready');
+ break;
+ }
  await delay(1000);
  }
  
- await delay(1000);
+ await delay(500);
  
- console.log('[CODE] Getting...');
+ // Get pairing code
+ console.log('[GET] Pairing code...');
  const code = await Promise.race([
  sock.requestPairingCode(number),
- new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 8000))
+ new Promise((_, reject) => 
+ setTimeout(() => reject(new Error("Code generation timeout")), 10000)
+ )
  ]);
  
- console.log(`✅ ${code}`);
+ console.log(`✅ [CODE] ${code}`);
  
- res.json({ 
+ return res.json({
  success: true,
  code: code,
- message: "Enter code in WhatsApp → Settings → Linked Devices",
- expires: 60
+ number: number,
+ instruction: "Go to WhatsApp → Settings → Linked Devices → Scan with phone",
+ valid_for: "60 seconds"
  });
  
  } catch (err) {
  console.error('[ERROR]', err.message);
  sock = null;
- res.status(503).json({ error: err.message });
+ connectionReady = false;
+ 
+ res.status(503).json({ 
+ error: err.message,
+ recovery: "Call /reset and try again after 5 minutes"
+ });
  }
 });
 
+// Status check
 app.get('/status', (req, res) => {
- res.json({ 
- connected: sock?.user ? true : false,
- user: sock?.user?.id || null
+ res.json({
+ socket_ready: sock ? true : false,
+ connection_open: connectionReady,
+ linked_user: sock?.user?.id || null
  });
 });
 
+// Reset everything
 app.get('/reset', (req, res) => {
  clearSession();
  sock = null;
- qrGenerated = null;
- console.log("[RESET]");
- res.json({ ok: true, wait: "5 min before next attempt" });
+ connectionReady = false;
+ console.log("[RESET] Complete");
+ res.json({ 
+ status: "reset",
+ message: "Wait 5 minutes before trying again"
+ });
 });
 
-app.get('/health', (req, res) => {
- res.json({ status: "ok" });
+// Health check
+app.get('/', (req, res) => {
+ res.json({ 
+ status: "ok",
+ endpoints: [
+ "/pair?number=923497181963",
+ "/status",
+ "/reset"
+ ]
+ });
 });
 
 app.listen(port, "0.0.0.0", () => {
- console.log(`[SERVER] ${port}`);
+ console.log(`[SERVER] Port ${port}`);
 });
