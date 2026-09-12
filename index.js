@@ -1,12 +1,13 @@
 if (!global.crypto) {
- try { global.crypto = require('crypto'); } catch (e) {}
+    try { global.crypto = require('crypto'); } catch (e) {}
 }
 
 const { 
- default: makeWASocket, 
- useMultiFileAuthState, 
- delay,
- fetchLatestBaileysVersion
+    default: makeWASocket, 
+    useMultiFileAuthState, 
+    delay, 
+    DisconnectReason,
+    fetchLatestBaileysVersion
 } = require("@whiskeysockets/baileys");
 const express = require("express");
 const cors = require("cors");
@@ -19,155 +20,100 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-const SESSION_PATH = fs.existsSync('/data') ? '/data/auth' : './auth';
+// Log every request to help debugging
+app.use((req, res, next) => {
+    console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+    next();
+});
 
+// VOLUME PATH: Direct /data use karein agar exists
+const SESSION_PATH = fs.existsSync('/data') ? '/data' : './auth_info';
 let sock = null;
-let connectionReady = false;
 
-function clearSession() {
- try {
- if (fs.existsSync(SESSION_PATH)) {
- fs.rmSync(SESSION_PATH, { recursive: true, force: true });
- console.log("[✓] Cleared");
- }
- } catch (e) {}
+async function startWhatsApp() {
+    console.log(`[SYSTEM] Starting WhatsApp session at ${SESSION_PATH}...`);
+    const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+    const { version } = await fetchLatestBaileysVersion();
+
+    sock = makeWASocket({
+        version,
+        auth: state,
+        logger: pino({ level: 'info' }), // Detailed logs
+        printQRInTerminal: false,
+        browser: ["Chrome (Linux)", "", ""], // Official pairing browser format
+        syncFullHistory: false
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', (update) => {
+        const { connection, lastDisconnect } = update;
+        if (connection === 'close') {
+            const reason = lastDisconnect?.error?.output?.statusCode;
+            if (reason !== DisconnectReason.loggedOut) {
+                console.log(`[CONN] Reconnecting (Reason: ${reason})...`);
+                setTimeout(startWhatsApp, 5000);
+            } else {
+                console.log("[CONN] Logged out. Clearing /data...");
+                if (fs.existsSync(SESSION_PATH + '/creds.json')) fs.unlinkSync(SESSION_PATH + '/creds.json');
+                startWhatsApp();
+            }
+        } else if (connection === 'open') {
+            console.log('✅ [SUCCESS] WhatsApp Linked!');
+        }
+    });
+
+    return sock;
 }
 
-async function startSocket() {
- console.log("[START] Socket...");
- 
- const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
- const { version } = await fetchLatestBaileysVersion();
- 
- sock = makeWASocket({
- version,
- auth: state,
- logger: pino({ level: 'error' }),
- browser: ["Ubuntu", "Chrome", "20.0.04"],
- connectTimeoutMs: 20000,
- keepAliveIntervalMs: 20000,
- syncFullHistory: false,
- });
- 
- sock.ev.on('creds.update', saveCreds);
- 
- sock.ev.on('connection.update', (update) => {
- const { connection, lastDisconnect, isNewLogin } = update;
- 
- if (connection === 'open') {
- connectionReady = true;
- console.log('✅ [READY]');
- }
- 
- if (connection === 'close') {
- const code = lastDisconnect?.error?.output?.statusCode;
- console.log(`[CLOSE] ${code}`);
- connectionReady = false;
- sock = null;
- 
- if (code !== 401 && code !== 403 && code !== 405) {
- setTimeout(startSocket, 5000);
- }
- }
- });
- 
- return sock;
-}
+// Pairing Endpoint
+app.get('/get-code', async (req, res) => {
+    let number = req.query.number;
+    if (!number) return res.status(400).json({ error: "No number provided" });
+    number = number.replace(/\D/g, '');
 
-// MAIN ENDPOINT
-app.get('/pair', async (req, res) => {
- res.setTimeout(30000);
- 
- try {
- const number = (req.query.number || '').replace(/\D/g, '');
- 
- if (!number || number.length < 10) {
- return res.status(400).json({ error: "Invalid number. Example: 923497181963" });
- }
- 
- console.log(`[PAIR] ${number}`);
- 
- // Start socket if needed
- if (!sock) {
- console.log('[INIT]');
- sock = await startSocket();
- }
- 
- // Wait for socket to be ready (max 15 seconds)
- for (let i = 0; i < 15; i++) {
- if (sock?.ws?.readyState === 1) {
- console.log('[WS] Ready');
- break;
- }
- await delay(1000);
- }
- 
- await delay(500);
- 
- // Get pairing code
- console.log('[GET] Pairing code...');
- const code = await Promise.race([
- sock.requestPairingCode(number),
- new Promise((_, reject) => 
- setTimeout(() => reject(new Error("Code generation timeout")), 10000)
- )
- ]);
- 
- console.log(`✅ [CODE] ${code}`);
- 
- return res.json({
- success: true,
- code: code,
- number: number,
- instruction: "Go to WhatsApp → Settings → Linked Devices → Scan with phone",
- valid_for: "60 seconds"
- });
- 
- } catch (err) {
- console.error('[ERROR]', err.message);
- sock = null;
- connectionReady = false;
- 
- res.status(503).json({ 
- error: err.message,
- recovery: "Call /reset and try again after 5 minutes"
- });
- }
+    try {
+        if (!sock || sock.ws?.readyState !== 1) {
+            await startWhatsApp();
+            await delay(5000);
+        }
+
+        // Wait up to 20s for readyState
+        let attempts = 0;
+        while (sock.ws?.readyState !== 1 && attempts < 20) {
+            await delay(1000);
+            attempts++;
+        }
+
+        if (sock.ws?.readyState === 1) {
+            await delay(2000); // Buffer for stability
+            const code = await sock.requestPairingCode(number);
+            console.log(`[PAIR] Code for ${number}: ${code}`);
+            res.json({ code });
+        } else {
+            res.status(503).json({ error: "Server initializing. Try again in 10s." });
+        }
+    } catch (err) {
+        console.error("[PAIR ERROR]", err.message);
+        res.status(500).json({ error: "Pairing failed. Server busy." });
+    }
 });
 
-// Status check
-app.get('/status', (req, res) => {
- res.json({
- socket_ready: sock ? true : false,
- connection_open: connectionReady,
- linked_user: sock?.user?.id || null
- });
+// Check Number
+app.get('/check', async (req, res) => {
+    const number = req.query.number;
+    if (!sock?.user) return res.status(400).json({ error: "Server not linked" });
+    try {
+        const [result] = await sock.onWhatsApp(number);
+        res.json({ exists: !!result?.exists });
+    } catch (err) {
+        res.status(500).json({ error: "Check failed" });
+    }
 });
 
-// Reset everything
-app.get('/reset', (req, res) => {
- clearSession();
- sock = null;
- connectionReady = false;
- console.log("[RESET] Complete");
- res.json({ 
- status: "reset",
- message: "Wait 5 minutes before trying again"
- });
-});
-
-// Health check
-app.get('/', (req, res) => {
- res.json({ 
- status: "ok",
- endpoints: [
- "/pair?number=923497181963",
- "/status",
- "/reset"
- ]
- });
-});
+app.get('/', (req, res) => res.send("Server is Healthy"));
 
 app.listen(port, "0.0.0.0", () => {
- console.log(`[SERVER] Port ${port}`);
+    console.log(`[SERVER] Online on port ${port}`);
+    startWhatsApp().catch(console.error);
 });
