@@ -20,34 +20,44 @@ const port = process.env.PORT || 3000;
 app.use(cors());
 app.use(express.json());
 
-// VOLUME PATH: Agar /data mounted hai toh session wahan store hoga
+// Volume Path: Persistent storage for Railway
 const SESSION_PATH = fs.existsSync('/data') ? '/data' : './session';
 let sock = null;
+let connectionState = 'closed';
 
 async function startWhatsApp() {
-    console.log(`[SYSTEM] Initializing WhatsApp session at ${SESSION_PATH}...`);
+    console.log(`[SYSTEM] Starting session at ${SESSION_PATH}...`);
     const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
     const { version } = await fetchLatestBaileysVersion();
+
+    // Reset socket if already exists
+    if (sock) {
+        sock.ev.removeAllListeners();
+        try { sock.ws.close(); } catch(e) {}
+    }
 
     sock = makeWASocket({
         version,
         auth: state,
-        logger: pino({ level: 'silent' }), // Silent logs to prevent spam
+        logger: pino({ level: 'silent' }),
         printQRInTerminal: false,
         browser: ["Chrome (Linux)", "", ""], // Official pairing format
-        syncFullHistory: false
+        connectTimeoutMs: 60000,
+        keepAliveIntervalMs: 10000
     });
 
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
+        connectionState = connection;
+        
         if (connection === 'close') {
             const reason = lastDisconnect?.error?.output?.statusCode;
             console.log(`[CONN] Closed. Reason: ${reason}`);
-            // Reconnect logic
             if (reason !== DisconnectReason.loggedOut) {
-                setTimeout(startWhatsApp, 5000);
+                console.log("[CONN] Reconnecting...");
+                setTimeout(startWhatsApp, 3000);
             }
         } else if (connection === 'open') {
             console.log('✅ [SUCCESS] WhatsApp Linked!');
@@ -59,38 +69,43 @@ async function startWhatsApp() {
 
 // Pairing Endpoint
 app.get('/get-code', async (req, res) => {
-    const number = req.query.number?.replace(/\D/g, '');
+    let number = req.query.number?.replace(/\D/g, '');
     if (!number) return res.status(400).json({ error: "No number provided" });
 
+    console.log(`[REQUEST] Pairing code for ${number}`);
+
     try {
-        // Force reset socket if not connected
+        // Force start if not connected
         if (!sock || sock.ws?.readyState !== 1) {
             await startWhatsApp();
-            await delay(5000);
         }
 
-        // Wait up to 15s for readyState
+        // Wait up to 30 seconds for socket to be ready
         let attempts = 0;
-        while (sock.ws?.readyState !== 1 && attempts < 15) {
+        const maxAttempts = 30;
+        
+        while ((!sock || sock.ws?.readyState !== 1) && attempts < maxAttempts) {
             await delay(1000);
             attempts++;
+            if (attempts % 5 === 0) console.log(`[WAIT] Socket not ready yet... (${attempts}s)`);
         }
 
-        if (sock.ws?.readyState === 1) {
-            await delay(3000); // Wait for keys to settle
+        if (sock && sock.ws?.readyState === 1) {
+            await delay(2000); // Small buffer for encryption keys
+            console.log(`[PAIR] Requesting code for ${number}`);
             const code = await sock.requestPairingCode(number);
-            console.log(`[PAIR] Code generated for ${number}: ${code}`);
+            console.log(`[PAIR] SUCCESS: ${code}`);
             res.json({ code });
         } else {
-            res.status(503).json({ error: "Connection Timeout. Try again in 5s." });
+            console.error("[ERROR] Socket initialization failed after 30s");
+            res.status(503).json({ error: "Server is taking too long to connect. Please try again in 10 seconds." });
         }
     } catch (err) {
         console.error("[PAIR ERROR]", err.message);
-        res.status(500).json({ error: "Could not generate code. Please retry." });
+        res.status(500).json({ error: "Pairing failed. Please ensure the number is correct and try again." });
     }
 });
 
-// Check Number Status
 app.get('/check', async (req, res) => {
     const number = req.query.number;
     if (!sock?.user) return res.status(400).json({ error: "Not linked" });
@@ -102,7 +117,7 @@ app.get('/check', async (req, res) => {
     }
 });
 
-app.get('/', (req, res) => res.send("Server is Active"));
+app.get('/', (req, res) => res.send("WhatsApp Tool Server is Online"));
 
 app.listen(port, "0.0.0.0", () => {
     console.log(`[SERVER] Online on port ${port}`);
