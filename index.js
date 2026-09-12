@@ -1,186 +1,171 @@
+if (!global.crypto) {
+ try { global.crypto = require('crypto'); } catch (e) {}
+}
+
+const { 
+ default: makeWASocket, 
+ useMultiFileAuthState, 
+ delay
+} = require("@whiskeysockets/baileys");
 const express = require("express");
 const cors = require("cors");
+const pino = require("pino");
 const fs = require("fs");
 const path = require("path");
+
 const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
 app.use(express.json());
 
-const SESSION_PATH = fs.existsSync('/data') ? '/data/.wbot' : './.wbot';
+const SESSION_PATH = fs.existsSync('/data') ? '/data/auth' : './auth';
 
-if (!fs.existsSync(SESSION_PATH)) {
- fs.mkdirSync(SESSION_PATH, { recursive: true });
-}
+let sock = null;
+let qrGenerated = null;
 
-let client = null;
-let isConnected = false;
-
-async function initClient() {
+function clearSession() {
  try {
- console.log("[INIT] Loading WhatsApp Web...");
- 
- const { Client, LocalAuth } = require("whatsapp-web.js");
- 
- client = new Client({
- authStrategy: new LocalAuth({ 
- clientId: "main",
- dataPath: SESSION_PATH 
- }),
- puppeteer: {
- headless: true,
- args: [
- '--no-sandbox',
- '--disable-setuid-sandbox',
- '--disable-dev-shm-usage',
- '--disable-gpu',
- '--single-process'
- ],
- timeout: 30000
- },
- restartOnCrash: true,
- takeoverOnConflict: true,
- qrMaxRetries: 5,
- });
- 
- client.on('qr', (qr) => {
- console.log('[QR] Generated - scan with WhatsApp');
- });
- 
- client.on('ready', () => {
- console.log('✅ [READY] WhatsApp connected!');
- isConnected = true;
- });
- 
- client.on('authenticated', () => {
- console.log('✅ [AUTH] Authenticated');
- isConnected = true;
- });
- 
- client.on('auth_failure', () => {
- console.log('[FAIL] Auth failed');
- isConnected = false;
- });
- 
- client.on('disconnected', () => {
- console.log('[DISC] Disconnected');
- isConnected = false;
- });
- 
- await client.initialize();
- console.log('[OK] Client initialized');
- 
- } catch (err) {
- console.error('[ERROR]', err.message);
- throw err;
+ if (fs.existsSync(SESSION_PATH)) {
+ fs.rmSync(SESSION_PATH, { recursive: true, force: true });
+ console.log("[✓] Session cleared");
+ }
+ } catch (e) {
+ console.error("[ERROR]", e.message);
  }
 }
 
-// Initialize on startup
-initClient().catch(err => {
- console.log("[WARN] Will init on first request:", err.message);
-});
+async function connectWA() {
+ return new Promise(async (resolve, reject) => {
+ try {
+ console.log("[CONNECT] Initializing...");
+ 
+ const { state, saveCreds } = await useMultiFileAuthState(SESSION_PATH);
+ 
+ sock = makeWASocket({
+ auth: state,
+ logger: pino({ level: 'fatal' }),
+ browser: ["Ubuntu", "Chrome", "20.0.04"],
+ connectTimeoutMs: 30000,
+ keepAliveIntervalMs: 25000,
+ defaultQueryTimeoutMs: 30000,
+ syncFullHistory: false,
+ printQRInTerminal: false,
+ });
+ 
+ sock.ev.on('creds.update', saveCreds);
+ 
+ let opened = false;
+ 
+ sock.ev.on('connection.update', (update) => {
+ const { connection, lastDisconnect, qr, isNewLogin } = update;
+ 
+ if (qr) {
+ console.log('[QR] Generated');
+ qrGenerated = qr;
+ }
+ 
+ if (connection === 'open') {
+ opened = true;
+ console.log('✅ [OPEN]');
+ resolve(sock);
+ } else if (connection === 'close') {
+ const code = lastDisconnect?.error?.output?.statusCode;
+ console.log(`[CLOSE] ${code}`);
+ 
+ if (!opened) {
+ reject(new Error(`Close: ${code}`));
+ }
+ sock = null;
+ }
+ });
+ 
+ setTimeout(() => {
+ if (!opened && !qrGenerated) {
+ reject(new Error("Timeout"));
+ }
+ }, 25000);
+ 
+ } catch (err) {
+ console.error("[ERROR]", err.message);
+ reject(err);
+ }
+ });
+}
 
-// Get pairing code
-app.get('/get-code', async (req, res) => {
- res.setTimeout(40000);
+// Main endpoint - bilkul simple
+app.get('/connect', async (req, res) => {
+ res.setTimeout(35000);
  
  try {
  const number = (req.query.number || '').replace(/\D/g, '');
  
- if (!number || number.length < 10) {
+ if (number.length < 10) {
  return res.status(400).json({ error: "Invalid number" });
  }
  
- console.log(`[CODE] Request for ${number}`);
+ console.log(`[REQUEST] ${number}`);
  
- // Init if needed
- if (!client) {
+ if (!sock) {
  console.log('[INIT]');
- await initClient();
+ try {
+ sock = await connectWA();
+ } catch (err) {
+ console.error('[CONNECT ERROR]', err.message);
+ sock = null;
+ return res.status(503).json({ error: err.message });
+ }
  }
  
- // Wait for ready max 30s
- for (let i = 0; i < 30; i++) {
- if (isConnected) break;
- await new Promise(r => setTimeout(r, 1000));
+ // Wait for socket ready
+ for (let i = 0; i < 20; i++) {
+ if (sock?.ws?.readyState === 1) break;
+ await delay(1000);
  }
  
- if (!isConnected) {
- return res.json({
- status: "connecting",
- message: "Scan QR code with WhatsApp (appears in logs)"
- });
- }
+ await delay(1000);
  
- console.log('[GET] Pairing code...');
+ console.log('[CODE] Getting...');
+ const code = await Promise.race([
+ sock.requestPairingCode(number),
+ new Promise((_, reject) => setTimeout(() => reject(new Error("Timeout")), 8000))
+ ]);
  
- const code = await client.requestPairingCode(number);
+ console.log(`✅ ${code}`);
  
- console.log(`✅ [CODE] ${code}`);
- 
- return res.json({
+ res.json({ 
+ success: true,
  code: code,
- expires: "60 seconds",
- instruction: "Enter in WhatsApp → Settings → Linked Devices"
+ message: "Enter code in WhatsApp → Settings → Linked Devices",
+ expires: 60
  });
  
  } catch (err) {
  console.error('[ERROR]', err.message);
- 
- if (!res.headersSent) {
- res.status(503).json({ 
- error: err.message,
- tip: "Try /reset"
- });
- }
+ sock = null;
+ res.status(503).json({ error: err.message });
  }
 });
 
-// Status
 app.get('/status', (req, res) => {
- res.json({
- connected: isConnected,
- message: isConnected ? "Ready!" : "Connecting..."
+ res.json({ 
+ connected: sock?.user ? true : false,
+ user: sock?.user?.id || null
  });
 });
 
-// Reset
-app.get('/reset', async (req, res) => {
- try {
- console.log('[RESET]');
- 
- if (client) {
- try {
- await client.logout();
- } catch (e) {}
- await client.destroy();
- }
- 
- if (fs.existsSync(SESSION_PATH)) {
- fs.rmSync(SESSION_PATH, { recursive: true, force: true });
- }
- 
- client = null;
- isConnected = false;
- 
- // Restart
- setTimeout(() => initClient().catch(console.error), 2000);
- 
- res.json({ status: "reset", wait: "5 minutes" });
- 
- } catch (err) {
- console.error('[ERROR]', err.message);
- res.status(500).json({ error: err.message });
- }
+app.get('/reset', (req, res) => {
+ clearSession();
+ sock = null;
+ qrGenerated = null;
+ console.log("[RESET]");
+ res.json({ ok: true, wait: "5 min before next attempt" });
 });
 
-// Health
 app.get('/health', (req, res) => {
- res.json({ ok: true });
+ res.json({ status: "ok" });
 });
 
 app.listen(port, "0.0.0.0", () => {
- console.log(`[SERVER] Port ${port}`);
+ console.log(`[SERVER] ${port}`);
 });
